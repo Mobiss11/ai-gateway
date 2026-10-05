@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон LaunchAgent для AI Gateway (Mac mini).
+  Скопируйте в ~/Library/LaunchAgents/com.alluc.ai-gateway.plist и подставьте
+  реальные пути. Ожидается размещение проекта в /Users/youruser/ai-gateway.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alluc.ai-gateway</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/youruser/ai-gateway/.venv/bin/python</string>
+        <string>/Users/youruser/ai-gateway/gateway.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/youruser/ai-gateway</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_GATEWAY_CONFIG</key>
+        <string>/Users/youruser/.config/ai-gateway/config.json</string>
+        <key>AI_GATEWAY_ENV_FILE</key>
+        <string>/Users/youruser/.config/ai-gateway/env</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/youruser/ai-gateway/logs/ai-gateway.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/youruser/ai-gateway/logs/ai-gateway.err.log</string>
+</dict>
+</plist>

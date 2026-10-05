@@ -1,0 +1,22 @@
+diff --git a/client.go b/client.go
+index 534f3a6..86fde27 100644
+--- a/client.go
++++ b/client.go
+@@ -22,7 +22,7 @@ const (
+ 	DefaultAPIVersion = "2023-06-01"
+ 
+ 	// ccVersion is the Claude Code version we impersonate for the billing header.
+-	ccVersion = "2.1.92.00a"
++	ccVersion = "2.1.300.00a"
+ 
+ 	// ccEntrypoint is the entrypoint identifier for the billing header.
+ 	ccEntrypoint = "cli"
+@@ -538,7 +538,7 @@ func (c *Client) doWithModel(ctx context.Context, method, path string, model str
+ 		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+ 	}
+ 	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+-	req.Header.Set("User-Agent", "claude-cli/2.1.92 (external, cli)")
++	req.Header.Set("User-Agent", "claude-cli/2.1.300 (external, cli)")
+ 	req.Header.Set("x-app", "cli")
+ 	req.Header.Set("Anthropic-Beta", betaHeadersForModel(model))
+ 

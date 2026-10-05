@@ -1,0 +1,30 @@
+{
+  "listen": {"host": "127.0.0.1", "port": 8130},
+  "auth": {"token": null, "token_env": "AI_GATEWAY_TOKEN"},
+  "request_timeout_seconds": 300,
+  "catalog_path": "~/.config/ai-gateway/catalog.json",
+  "upstreams": {
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "headers": {}
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "headers": {}
+    }
+  },
+  "models": {
+    "deepseek-flash": {
+      "upstream": "deepseek",
+      "model": "deepseek-flash",
+      "name": "DeepSeek Flash"
+    },
+    "deepseek-v4-pro": {
+      "upstream": "deepseek",
+      "model": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro"
+    }
+  }
+}

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон LaunchAgent для локального AI Gateway с Claude Code CLI (MacBook).
+  Скопируйте в ~/Library/LaunchAgents/com.alluc.ai-gateway-claude.plist и
+  подставьте реальные пути. Запускается из рабочей копии репозитория.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alluc.ai-gateway-claude</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/youruser/Documents/ai-gateway/.venv/bin/python</string>
+        <string>/Users/youruser/Documents/ai-gateway/gateway.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/youruser/Documents/ai-gateway</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_GATEWAY_CONFIG</key>
+        <string>/Users/youruser/.config/ai-gateway/config-claude.json</string>
+        <key>AI_GATEWAY_ENV_FILE</key>
+        <string>/Users/youruser/.config/ai-gateway/env-claude</string>
+        <key>PATH</key>
+        <string>/Users/youruser/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/youruser</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/youruser/.local/share/ai-gateway/logs/claude-gateway.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/youruser/.local/share/ai-gateway/logs/claude-gateway.err.log</string>
+</dict>
+</plist>

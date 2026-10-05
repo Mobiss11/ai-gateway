@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон LaunchAgent: SSH-SOCKS-туннель для Claude-трафика kraube
+  (mac mini → выделенный сервер, только port-forwarding).
+
+  Требования:
+  - ключ ~/.ssh/id_kraube_proxy (без парольной фразы; на сервере запись в
+    authorized_keys с "restrict,port-forwarding" — шелла у ключа нет);
+  - host key сервера в ~/.ssh/known_hosts (ssh-keyscan);
+  - kraube читает HTTPS_PROXY из ~/.config/kraube/env:
+      HTTPS_PROXY=socks5h://127.0.0.1:1080
+    (socks5h = DNS резолвится на сервере; туннель слушает только loopback).
+
+  Отдельный процесс для устойчивости: launchd перезапускает ssh при обрыве
+  (ThrottleInterval 10), ServerAlive ловит зависшие соединения за ~60 сек.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alluc.kraube-proxy-tunnel</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-i</string>
+        <string>/Users/youruser/.ssh/id_kraube_proxy</string>
+        <string>-N</string>
+        <string>-D</string>
+        <string>127.0.0.1:1080</string>
+        <string>-o</string>
+        <string>BatchMode=yes</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=15</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=4</string>
+        <string>-o</string>
+        <string>StrictHostKeyChecking=yes</string>
+        <string>-o</string>
+        <string>Ciphers=aes128-gcm@openssh.com</string>
+        <string>user@your-server.example</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>ThrottleInterval</key>
+        <integer>10</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/youruser/Library/Logs/kraube-proxy-tunnel.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/youruser/Library/Logs/kraube-proxy-tunnel.log</string>
+</dict>
+</plist>

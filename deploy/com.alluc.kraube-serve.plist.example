@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон LaunchAgent для демона `kraube serve` (Anthropic Messages через
+  OAuth-подписку Claude). Скопируйте в
+  ~/Library/LaunchAgents/com.alluc.kraube-serve.plist и подставьте
+  реальные пути.
+
+  Требования:
+  - бинарь kraube: ~/.local/bin/kraube (права 0755);
+  - ключ serve в ~/.config/kraube/env (права 0600):
+      KRAUBE_SERVE_KEY=<случайный-длинный-ключ>
+    (то же значение — в env-файл ai-gateway, см. README);
+  - credentials после `kraube login`: ~/.config/kraube/credentials.json.
+    Демон владеет файлом единолично: пока он запущен, `kraube login`/
+    `kraube query` запускать не нужно (refresh-токен одноразовый).
+
+  ВАЖНО про wrapper: `set -a` обязателен. Без него `. env-файл` задаёт
+  только shell-переменные, они НЕ попадают в окружение exec-нутого
+  процесса — демон стартует без ключа (на loopback kraube тогда пускает
+  всех) и без HTTPS_PROXY (трафик пойдёт напрямую, мимо туннеля).
+  `--proxy` задан явным флагом (надёжнее env) — SSH-SOCKS-туннель
+  127.0.0.1:1080 (см. com.alluc.kraube-proxy-tunnel.plist.example).
+
+  kraube слушает только 127.0.0.1:8787; наружу его не публикуем — доступ
+  идёт через ai-gateway (http://127.0.0.1:8787/v1/messages).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alluc.kraube-serve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -a; . "$HOME/.config/kraube/env"; exec "$HOME/.local/bin/kraube" --proxy socks5h://127.0.0.1:1080 serve --listen 127.0.0.1:8787</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/youruser/Library/Logs/kraube-serve.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/youruser/Library/Logs/kraube-serve.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# macOS
+.DS_Store
+
+# Локальные запуски и логи
+logs/
+*.log
+
+# Внутренние артефакты аудита (не входят в публичный репозиторий)
+audit/
+docs/verification.md
