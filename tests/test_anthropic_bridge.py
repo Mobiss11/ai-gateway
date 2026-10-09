@@ -493,6 +493,135 @@ def test_explicit_anthropic_thinking_passthrough() -> None:
     assert request["max_tokens"] == 8192
 
 
+# --------------------------------------------------------------------------- #
+# Adaptive thinking (Claude 5+): output_config.effort
+# --------------------------------------------------------------------------- #
+def test_effort_capable_detection_by_provider_model() -> None:
+    for model in (
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-opus-5",
+        "claude-fable-5-1",
+        "claude-haiku-5-5",
+        "CLAUDE-OPUS-5-5",
+    ):
+        assert anthropic_bridge._is_effort_capable(model) is True, model
+    for model in (
+        "claude-haiku-4-5",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "m",
+        "",
+        "gpt-5",
+    ):
+        assert anthropic_bridge._is_effort_capable(model) is False, model
+
+
+def test_adaptive_thinking_effort_maps_to_output_config() -> None:
+    base = {"messages": [{"role": "user", "content": "q"}]}
+    for effort, expected in (
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "max"),
+    ):
+        request = anthropic_bridge.openai_to_anthropic(
+            {**base, "reasoning_effort": effort}, "claude-opus-5-5"
+        )
+        assert request["output_config"] == {"effort": expected}, effort
+        assert "thinking" not in request
+
+    # reasoning.effort (OpenRouter-форма) тоже работает
+    request = anthropic_bridge.openai_to_anthropic(
+        {"messages": base["messages"], "reasoning": {"effort": "high"}},
+        "claude-opus-5-5",
+    )
+    assert request["output_config"] == {"effort": "high"}
+
+    with pytest.raises(anthropic_bridge.TranslationError):
+        anthropic_bridge.openai_to_anthropic(
+            {**base, "reasoning_effort": "ultra"}, "claude-opus-5-5"
+        )
+
+
+def test_adaptive_thinking_disabled_or_absent_sends_nothing() -> None:
+    base = {"messages": [{"role": "user", "content": "q"}]}
+    for effort in (None, "none", "off", "disabled", "false", "", "default"):
+        body = dict(base) if effort is None else {**base, "reasoning_effort": effort}
+        request = anthropic_bridge.openai_to_anthropic(body, "claude-opus-5-5")
+        assert "output_config" not in request, effort
+        assert "thinking" not in request, effort
+
+
+def test_adaptive_thinking_drops_explicit_thinking_and_honours_output_config() -> None:
+    base = {"messages": [{"role": "user", "content": "q"}]}
+    for thinking in (
+        {"type": "enabled", "budget_tokens": 2048},
+        {"type": "disabled"},
+    ):
+        request = anthropic_bridge.openai_to_anthropic(
+            {**base, "thinking": thinking}, "claude-opus-5-5"
+        )
+        assert "thinking" not in request
+        assert "output_config" not in request
+
+    # явный output_config форвардится как есть и важнее reasoning_effort
+    request = anthropic_bridge.openai_to_anthropic(
+        {
+            **base,
+            "output_config": {"effort": "max"},
+            "reasoning_effort": "ultra",
+        },
+        "claude-opus-5-5",
+    )
+    assert request["output_config"] == {"effort": "max"}
+    assert "thinking" not in request
+
+
+def test_adaptive_thinking_sampling_and_max_tokens() -> None:
+    base = {
+        "messages": [{"role": "user", "content": "q"}],
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "reasoning_effort": "high",
+    }
+    # без max_tokens — дефолт 32768, sampling убран
+    request = anthropic_bridge.openai_to_anthropic(dict(base), "claude-opus-5-5")
+    assert request["max_tokens"] == anthropic_bridge.EFFORT_DEFAULT_MAX_TOKENS == 32768
+    assert "temperature" not in request
+    assert "top_p" not in request
+
+    # клиентский max_tokens не трогаем (без budget bump)
+    request = anthropic_bridge.openai_to_anthropic(
+        {**base, "max_tokens": 1000}, "claude-opus-5-5"
+    )
+    assert request["max_tokens"] == 1000
+    assert request["output_config"] == {"effort": "high"}
+
+    request = anthropic_bridge.openai_to_anthropic(
+        {**base, "max_completion_tokens": 2048}, "claude-opus-5-5"
+    )
+    assert request["max_tokens"] == 2048
+
+
+def test_haiku_4_5_keeps_legacy_thinking_budget() -> None:
+    body = {
+        "messages": [{"role": "user", "content": "q"}],
+        "reasoning_effort": "high",
+    }
+    request = anthropic_bridge.openai_to_anthropic(body, "claude-haiku-4-5")
+    assert request["thinking"] == {"type": "enabled", "budget_tokens": 16384}
+    assert "output_config" not in request
+    assert request["max_tokens"] == 17408
+
+    request = anthropic_bridge.openai_to_anthropic(
+        {"messages": [{"role": "user", "content": "q"}]}, "claude-haiku-4-5"
+    )
+    assert request["max_tokens"] == anthropic_bridge.DEFAULT_MAX_TOKENS
+
+
 def test_unsupported_things_raise_translation_error() -> None:
     base = {"messages": [{"role": "user", "content": "q"}]}
     with pytest.raises(anthropic_bridge.TranslationError):
@@ -988,6 +1117,38 @@ def test_gateway_reasoning_effort_reaches_anthropic_as_thinking() -> None:
     sent = json.loads(captured["request"].content)
     assert sent["thinking"] == {"type": "enabled", "budget_tokens": 1024}
     assert sent["max_tokens"] > 1024
+
+
+def test_gateway_effort_model_sends_output_config_not_thinking() -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=anthropic_message())
+
+    config = json.loads(json.dumps(ANTHROPIC_CONFIG))
+    config["models"]["claude-opus-5"] = {
+        "upstream": "kraube",
+        "model": "claude-opus-5-5",
+        "name": "Claude Opus 5.5 (subscription)",
+    }
+
+    with make_client(handler, config) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=AUTH,
+            json={
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "high",
+            },
+        )
+    assert response.status_code == 200
+    sent = json.loads(captured["request"].content)
+    assert sent["model"] == "claude-opus-5-5"
+    assert sent["output_config"] == {"effort": "high"}
+    assert "thinking" not in sent
+    assert sent["max_tokens"] == anthropic_bridge.EFFORT_DEFAULT_MAX_TOKENS
 
 
 def test_catalog_allowlist_skips_anthropic_upstreams() -> None:

@@ -64,7 +64,7 @@ extra-usage 400.
 | --- | --- |
 | 🔀 Форматы | OpenAI-проксирование как есть; `api_format: "anthropic"` — перевод в Messages API и обратно; `api_format: "claude-cli"` — локальный Claude Code CLI как upstream |
 | 📡 Streaming | SSE в обоих направлениях: потоковые `tool_calls`, `thinking` → `reasoning_content` (DeepSeek-стиль) |
-| 🧠 Reasoning | `reasoning_effort` / `reasoning.effort` → `thinking.budget_tokens` (none → выключено) |
+| 🧠 Reasoning | `reasoning_effort` / `reasoning.effort` → `output_config.effort` для Claude 5+ (adaptive thinking), `thinking.budget_tokens` для старых моделей (none → выключено) |
 | ⚡ Prompt cache | `cache_control`-брейкпоинты как в Claude Code: system → инструменты → история; повторяющийся префикс ~0.1x цены |
 | 🛡️ Anthropic-гоча | `move_env_to_user`: env-секция агентных клиентов переносится из system в user — иначе OAuth-подписка 400-ит «third-party app» |
 | 🧰 Tools | `tools`/`tool_choice` ↔ `tool_use`/`tool_result`, картинки `data:`/`http(s)` |
@@ -210,10 +210,15 @@ streaming, tools и `usage` с cache-полями. Типичный источн
 - `system`/`developer`-сообщения → поле `system`; `tool_calls` ↔
   `tool_use`; tool-сообщения → `tool_result`-блоки в user-сообщении
   (подряд идущие сливаются); картинки `data:`/`http(s)` → image-блоки;
-- `reasoning_effort` / `reasoning.effort` → extended thinking
-  (`budget_tokens` по уровню; `none` — выключено); блоки `thinking` в
-  ответе → `reasoning_content` (как DeepSeek); при включённом thinking
-  `temperature`/`top_p` не отправляются;
+- `reasoning_effort` / `reasoning.effort`: для Claude 5+ (`claude-<opus|sonnet|haiku|fable>-N`,
+  N ≥ 5; adaptive thinking всегда включён) → `output_config.effort`
+  (`minimal`→`low`, `low`…`max` как есть; `none` — без поля, действует
+  дефолт модели; legacy-`thinking` клиента не форвардится, явный
+  `output_config` — как есть; `temperature`/`top_p` не отправляются;
+  `max_tokens` по умолчанию 32768). Для остальных моделей (напр.
+  Haiku 4.5) — extended thinking с `budget_tokens` по уровню (`none` —
+  выключено); при включённом thinking `temperature`/`top_p` не
+  отправляются. Блоки `thinking` в ответе → `reasoning_content` (как DeepSeek);
 - `max_tokens` обязателен для Anthropic: если клиент не прислал — берётся
   `DEFAULT_MAX_TOKENS` (8192); при thinking бюджет всегда меньше
   `max_tokens`;

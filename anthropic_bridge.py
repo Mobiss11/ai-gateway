@@ -11,7 +11,9 @@
 tools / tool_choice, tool-результаты, stop-последовательности, streaming
 SSE (включая потоковые tool_calls), usage с cache-полями и extended
 thinking (``reasoning_effort`` → ``thinking.budget_tokens``, блоки
-thinking → ``reasoning_content`` в стиле DeepSeek).
+thinking → ``reasoning_content`` в стиле DeepSeek). Для Claude 5+
+(adaptive thinking) ``reasoning_effort`` уходит как ``output_config.effort``,
+legacy-бюджет там не форвардится (см. ``_is_effort_capable``).
 
 **Env-секция агентных клиентов** (``move_env_to_user``): Anthropic
 классифицирует env-секцию OpenCode в system-промпте (``Today's date: …``,
@@ -48,6 +50,21 @@ from typing import Any
 
 DEFAULT_MAX_TOKENS = 8192
 
+# Adaptive thinking (Claude 5+): глубина задаётся output_config.effort, а не
+# legacy-бюджетом thinking. Дефолтный потолок ответа для таких моделей —
+# 32768, если клиент не прислал max_tokens/max_completion_tokens.
+EFFORT_DEFAULT_MAX_TOKENS = 32768
+
+# reasoning_effort → output_config.effort. xhigh/max передаются как есть.
+EFFORT_MAP = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
 # Extended thinking: бюджет в tokens по reasoning_effort. Минимум API — 1024.
 MIN_THINKING_BUDGET = 1024
 THINKING_BUDGETS = {
@@ -59,6 +76,9 @@ THINKING_BUDGETS = {
     "max": 32768,
 }
 _DISABLED_EFFORTS = {"", "none", "off", "disabled", "false", "default"}
+
+# Adaptive-thinking модели: claude-<family>-<major>…, major >= 5.
+_EFFORT_MODEL_RE = re.compile(r"(?i)^claude-(?:opus|sonnet|haiku|fable)-(\d+)(?:$|-)")
 
 # env-секция OpenCode в system-промпте: «Today's date: …», строка-интро
 # «Here is some useful information about the environment you are running in:»
@@ -376,6 +396,48 @@ def _resolve_effort(body: dict[str, Any]) -> str | None:
     return None
 
 
+def _is_effort_capable(provider_model: str) -> bool:
+    """True для Claude-моделей с adaptive thinking (major-версия >= 5).
+
+    Такие модели принимают ``output_config: {"effort": …}`` вместо legacy
+    ``thinking``/``budget_tokens``. Мажорная версия берётся из
+    ``provider_model`` (case-insensitive): ``claude-opus-5-5``,
+    ``claude-sonnet-5-5``, ``claude-opus-5``, ``claude-fable-5-1``,
+    ``claude-haiku-5-5`` — True. ``claude-opus-4-6``,
+    ``claude-sonnet-4-6``, ``claude-haiku-4-5``, ``"m"`` и прочие имена —
+    False.
+    """
+    if not isinstance(provider_model, str):
+        return False
+    match = _EFFORT_MODEL_RE.match(provider_model)
+    if match is None:
+        return False
+    return int(match.group(1)) >= 5
+
+
+def _resolve_adaptive_thinking(
+    body: dict[str, Any],
+) -> tuple[dict[str, Any] | None, None]:
+    """(output_config, None) для effort-моделей.
+
+    Явный ``output_config``-dict из тела клиента форвардится как есть и
+    имеет приоритет над ``reasoning_effort``. Иначе ``reasoning_effort``
+    (или ``reasoning.effort``) мапится в ``{"effort": …}``; выключенные
+    значения (none/off/…) дают ``None``. thinking всегда ``None``:
+    legacy-бюджет на этих моделях не поддерживается и не форвардится.
+    """
+    explicit = body.get("output_config")
+    if isinstance(explicit, dict):
+        return dict(explicit), None
+    effort = _resolve_effort(body)
+    if effort is None or effort in _DISABLED_EFFORTS:
+        return None, None
+    mapped = EFFORT_MAP.get(effort)
+    if mapped is None:
+        raise TranslationError(f"unsupported reasoning_effort: {effort!r}")
+    return {"effort": mapped}, None
+
+
 def _resolve_thinking(
     body: dict[str, Any], max_tokens: int
 ) -> tuple[dict[str, Any] | None, int]:
@@ -506,10 +568,19 @@ def openai_to_anthropic(
     max_tokens = body.get("max_tokens")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         max_tokens = body.get("max_completion_tokens")
-    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
-        max_tokens = default_max_tokens
+    client_max_tokens = (
+        isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0
+    )
+    effort_capable = _is_effort_capable(provider_model)
+    if not client_max_tokens:
+        max_tokens = EFFORT_DEFAULT_MAX_TOKENS if effort_capable else default_max_tokens
 
-    thinking, max_tokens = _resolve_thinking(body, max_tokens)
+    output_config: dict[str, Any] | None = None
+    if effort_capable:
+        # Adaptive thinking: thinking не форвардим, max_tokens клиента не трогаем.
+        output_config, thinking = _resolve_adaptive_thinking(body)
+    else:
+        thinking, max_tokens = _resolve_thinking(body, max_tokens)
 
     request: dict[str, Any] = {
         "model": provider_model,
@@ -523,8 +594,9 @@ def openai_to_anthropic(
     if body.get("stream"):
         request["stream"] = True
 
-    # При включённом thinking API требует temperature=1 / top_p=1 — убираем.
-    if thinking is None:
+    # thinking всегда включён у effort-моделей и включается legacy-бюджетом
+    # у остальных: API требует temperature=1 / top_p=1 — в обоих случаях убираем.
+    if thinking is None and not effort_capable:
         temperature = body.get("temperature")
         if isinstance(temperature, (int, float)) and not isinstance(temperature, bool):
             request["temperature"] = temperature
@@ -551,6 +623,8 @@ def openai_to_anthropic(
 
     if thinking is not None:
         request["thinking"] = thinking
+    if output_config is not None:
+        request["output_config"] = output_config
     return _apply_prompt_cache(request)
 
 

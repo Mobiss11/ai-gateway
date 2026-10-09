@@ -217,9 +217,12 @@ OAuth-подписку Claude) получает переведённый зап�
   → anthropic_bridge.openai_to_anthropic()
       system/developer → system; tool_calls → tool_use;
       tool-сообщения → tool_result в user; картинки → image-блоки;
-      reasoning_effort/reasoning.effort → thinking.budget_tokens
-      (none — выключено; бюджет всегда < max_tokens, max_tokens при
-      необходимости поднимается; при thinking sampling не отправляется)
+      reasoning_effort/reasoning.effort → для Claude 5+ output_config.effort
+      (adaptive thinking, legacy thinking не форвардится, sampling не
+      отправляется, max_tokens по умолчанию 32768); для остальных —
+      thinking.budget_tokens (none — выключено; бюджет всегда < max_tokens,
+      max_tokens при необходимости поднимается; при thinking sampling
+      не отправляется)
   → POST {base_url}/v1/messages  (Bearer = api_key_env upstream'а)
   → ответ/SSE ← anthropic_bridge: anthropic_to_openai() или
       AnthropicStreamTranslator (SSE → chat.completion.chunk,
