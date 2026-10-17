@@ -171,7 +171,7 @@ Upstream с `"api_format": "anthropic"` говорит на Anthropic Messages A
 (`POST /v1/messages`), а не OpenAI. Шлюз переводит формат на лету: клиент
 по-прежнему присылает и получает OpenAI `chat/completions`, включая
 streaming, tools и `usage` с cache-полями. Типичный источник — локальный
-демон [`kraube serve`](https://github.com/scott-walker/kraube-api),
+демон [`kraube serve`](https://github.com/Mobiss11/kraube-api),
 проксирующий Anthropic Messages через OAuth-подписку Claude
 (Pro/Max/Team), без API-ключа.
 
@@ -434,8 +434,9 @@ PR приветствуются: код и тесты — на Rust/Python-ст�
 - [`opencode-claude-subscription`](https://github.com/Mobiss11/opencode-claude-subscription) —
   готовое решение «Claude в OpenCode по подписке» на базе этого шлюза:
   install/verify-скрипты, шаблоны, разбор extra-usage 400;
-- [`kraube`](https://github.com/scott-walker/kraube-api) — OAuth-прокси к
-  подписке Claude (upstream `api_format: "anthropic"`).
+- [`kraube`](https://github.com/Mobiss11/kraube-api) — OAuth-прокси к
+  подписке Claude (upstream `api_format: "anthropic"`); зеркало, оригинал
+  удалён автором.
 
 ## Лицензия
 
