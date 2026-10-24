@@ -354,6 +354,708 @@ def test_tools_and_tool_choice_translation() -> None:
     assert request["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
 
 
+# --------------------------------------------------------------------------- #
+# Санитайзер input_schema: upstream «anthropic» 400-ит на anyOf/oneOf/allOf и
+# требует единственный строковый "type" в каждом узле схемы
+# --------------------------------------------------------------------------- #
+_COMBINATOR_KEYS = ("anyOf", "oneOf", "allOf")
+
+
+def _combinator_paths(node: Any, path: str = "") -> list[str]:
+    """Пути всех anyOf/oneOf/allOf в дереве (рекурсивно)."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _COMBINATOR_KEYS:
+                found.append(f"{path}/{key}")
+            found.extend(_combinator_paths(value, f"{path}/{key}"))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found.extend(_combinator_paths(item, f"{path}[{index}]"))
+    return found
+
+
+def _input_schema(parameters: dict[str, Any], name: str = "tool") -> dict[str, Any]:
+    """Прогнать одну OpenAI-function-схему через _convert_tools."""
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": name, "description": "", "parameters": parameters},
+        }
+    ]
+    converted = anthropic_bridge._convert_tools(tools)
+    return converted[0]["input_schema"]
+
+
+def _schema_nodes(schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """Узлы-схемы: корень, значения properties и items (рекурсивно)."""
+    nodes = [schema]
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for value in properties.values():
+            if isinstance(value, dict):
+                nodes.extend(_schema_nodes(value))
+    items = schema.get("items")
+    if isinstance(items, dict):
+        nodes.extend(_schema_nodes(items))
+    return nodes
+
+
+def _assert_every_node_typed(schema: dict[str, Any]) -> None:
+    for node in _schema_nodes(schema):
+        assert isinstance(node.get("type"), str) and node["type"], node
+
+
+def test_tool_schema_without_combinators_is_unchanged() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "description": "City", "default": "Tokyo"},
+            "days": {"type": "integer", "minimum": 1, "maximum": 14},
+            "nested": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"zip": {"type": "string", "pattern": "^[0-9]+$"}},
+                    "additionalProperties": True,
+                },
+            },
+        },
+        "required": ["city"],
+    }
+    snapshot = json.loads(json.dumps(parameters))
+    schema = _input_schema(parameters)
+    assert schema == snapshot
+    # Чистая схема проходит без копирования — тот же объект.
+    assert schema is parameters
+    assert parameters == snapshot
+
+
+def test_tool_schema_strips_anyof_at_property_level() -> None:
+    """Форма terminal: notify с anyOf из bool и array → типизированный bool."""
+    parameters = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Shell command"},
+            "notify": {
+                "description": "true: one notification on exit",
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"type": "array", "items": {"type": "string"}},
+                ],
+            },
+        },
+        "required": ["command"],
+    }
+    schema = _input_schema(parameters)
+    assert schema["properties"]["notify"] == {
+        "type": "boolean",
+        "description": "true: one notification on exit",
+    }
+    # Соседние чистые поля не тронуты.
+    assert schema["properties"]["command"] == {
+        "type": "string",
+        "description": "Shell command",
+    }
+    assert schema["required"] == ["command"]
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_tool_schema_strips_anyof_inside_array_items() -> None:
+    """Форма manage_connections: array.items.anyOf из string и object."""
+    parameters = {
+        "type": "object",
+        "properties": {
+            "connectors": {
+                "type": "array",
+                "description": "Targets",
+                "items": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "required": ["name"],
+                        },
+                    ]
+                },
+            }
+        },
+    }
+    schema = _input_schema(parameters)
+    connectors = schema["properties"]["connectors"]
+    assert connectors["type"] == "array"
+    assert connectors["description"] == "Targets"
+    # Первый member с валидным типом — строка (union сведён к одному типу).
+    assert connectors["items"] == {"type": "string"}
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_tool_schema_strips_oneof_and_allof() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            "a": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            "b": {
+                "allOf": [
+                    {"type": "object", "properties": {"x": {"type": "string"}}},
+                    {"required": ["x"]},
+                ]
+            },
+            "c": {
+                "type": "array",
+                "items": {"oneOf": [{"type": "boolean"}]},
+            },
+        },
+    }
+    schema = _input_schema(parameters)
+    assert schema["properties"]["a"] == {"type": "string"}
+    # Полная схема выбранного member'а, включая вложенные properties.
+    assert schema["properties"]["b"] == {
+        "type": "object",
+        "properties": {"x": {"type": "string"}},
+    }
+    assert schema["properties"]["c"]["items"] == {"type": "boolean"}
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_combinator_members_without_string_type_are_skipped() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            # Первый member без type — пропускается, второй несёт "+".
+            "with_type": {
+                "oneOf": [
+                    {"description": "no type here"},
+                    {"enum": ["a", "b"]},
+                    {"type": "integer", "minimum": 1},
+                ]
+            },
+            # Ни один member не даёт строкового type → object-заглушка.
+            "without_type": {
+                "description": "Union без типов",
+                "default": None,
+                "anyOf": [{"enum": [1, 2]}, {"pattern": "^x$"}],
+            },
+        },
+    }
+    schema = _input_schema(parameters)
+    assert schema["properties"]["with_type"] == {"type": "integer", "minimum": 1}
+    assert schema["properties"]["without_type"] == {
+        "type": "object",
+        "description": "Union без типов",
+        "default": None,
+    }
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_tool_schema_strips_combinator_nested_in_combinator_member() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            # Единственный member сам без type → object-заглушка.
+            "x": {"anyOf": [{"oneOf": [{"type": "string"}]}]},
+            # Member с типом выбран, вложенный комбинатор вычищен рекурсивно.
+            "z": {
+                "anyOf": [
+                    {"oneOf": [{"type": "string"}]},
+                    {
+                        "type": "object",
+                        "properties": {"y": {"allOf": [{"type": "integer"}]}},
+                    },
+                ]
+            },
+        },
+    }
+    schema = _input_schema(parameters)
+    assert schema["properties"]["x"] == {"type": "object"}
+    assert schema["properties"]["z"] == {
+        "type": "object",
+        "properties": {"y": {"type": "integer"}},
+    }
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_combinator_node_keeps_description_and_default() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "description": "Mode selector",
+                "default": "auto",
+                "enum": ["auto", "manual"],
+                "anyOf": [
+                    {"type": "string", "description": "member desc"},
+                    {"type": "null"},
+                ],
+            }
+        },
+    }
+    schema = _input_schema(parameters)
+    # Описание/дефолт исходного узла побеждают поля member'а; type берётся
+    # из member'а, а enum исходного узла отброшен (иначе он бы конфликтовал).
+    assert schema["properties"]["mode"] == {
+        "type": "string",
+        "description": "Mode selector",
+        "default": "auto",
+    }
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_type_array_without_combinator_is_normalized() -> None:
+    parameters = {
+        "type": ["object", "null"],
+        "properties": {
+            "a": {"type": ["string", "null"], "description": "A"},
+            "b": {"type": [], "description": "B"},
+            "c": {"type": [1, "integer"]},
+            "nested": {
+                "type": "array",
+                "items": {"type": ["object", "string"]},
+            },
+        },
+    }
+    schema = _input_schema(parameters)
+    assert schema["type"] == "object"
+    assert schema["properties"]["a"] == {"type": "string", "description": "A"}
+    assert schema["properties"]["b"] == {"type": "object", "description": "B"}
+    assert schema["properties"]["c"] == {"type": "integer"}
+    assert schema["properties"]["nested"]["items"] == {"type": "object"}
+    _assert_every_node_typed(schema)
+
+
+def test_type_array_inside_chosen_combinator_member_is_normalized() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            "a": {
+                "anyOf": [
+                    {"type": ["string", "null"], "minLength": 1},
+                    {"type": "object"},
+                ]
+            }
+        },
+    }
+    schema = _input_schema(parameters)
+    # Первый member годится после сведения type-массива к строке.
+    assert schema["properties"]["a"] == {"type": "string", "minLength": 1}
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_combinator_replacements_are_never_permissive() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            "garbage": {"anyOf": ["x", None, {"type": ""}, {"type": [1, 2]}]},
+            "allof_not_list": {"allOf": {"type": "string"}},
+            "empty_members": {"oneOf": []},
+        },
+    }
+    schema = _input_schema(parameters)
+    for name in ("garbage", "allof_not_list", "empty_members"):
+        node = schema["properties"][name]
+        # Не {} и не description-only: upstream требует строковый type.
+        assert node == {"type": "object"}, name
+    assert _combinator_paths(schema) == []
+    _assert_every_node_typed(schema)
+
+
+def test_tool_schema_sanitizing_does_not_mutate_caller_dicts() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "manage_connections",
+                "description": "Connect",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "connectors": {
+                            "type": "array",
+                            "items": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {"name": {"type": "string"}},
+                                    },
+                                ]
+                            },
+                        }
+                    },
+                },
+            },
+        }
+    ]
+    snapshot = json.loads(json.dumps(tools))
+    anthropic_bridge._convert_tools(tools)
+    assert tools == snapshot
+
+
+# Урезанная выжимка из реального payload'а Hermes Agent (112 КБ, 35
+# инструментов): три схемы с комбинаторами (tools[18], [25], [34]) и одна
+# чистая. Полный файл в тесты не тащим.
+HERMES_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_connections",
+            "description": "Connect the user to apps.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "connect"]},
+                    "connectors": {
+                        "type": "array",
+                        "description": "Targets",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "mcp": {"type": "boolean"},
+                                        "alias": {"type": "string"},
+                                    },
+                                    "required": ["name"],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        },
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Execute shell commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command"},
+                    "background": {"type": "boolean", "default": False},
+                    "timeout": {"type": "integer", "minimum": 1},
+                    "notify": {
+                        "description": "With background=true.",
+                        "anyOf": [
+                            {"type": "boolean"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_manage",
+            "description": "Create, update, or delete skills.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "description": "Ordered ops",
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "action": {"type": "string", "enum": ["create"]},
+                                        "content": {"type": "string"},
+                                    },
+                                    "required": ["name", "action", "content"],
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "action": {"type": "string", "enum": ["delete"]},
+                                    },
+                                    "required": ["name", "action"],
+                                },
+                            ]
+                        },
+                    }
+                },
+                "required": ["operations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clarify",
+            "description": "Ask the user a question.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Question"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question"],
+            },
+        },
+    },
+]
+
+
+def test_hermes_fixture_tools_have_no_combinators() -> None:
+    converted = anthropic_bridge._convert_tools(HERMES_TOOLS)
+    by_name = {tool["name"]: tool for tool in converted}
+    for name in ("manage_connections", "terminal", "skill_manage", "clarify"):
+        assert _combinator_paths(by_name[name]["input_schema"]) == [], name
+        _assert_every_node_typed(by_name[name]["input_schema"])
+    assert by_name["terminal"]["input_schema"]["properties"]["notify"] == {
+        "type": "boolean",
+        "description": "With background=true.",
+    }
+    assert by_name["manage_connections"]["input_schema"]["properties"]["connectors"][
+        "items"
+    ] == {"type": "string"}
+    # Первый member operations.items сохраняется целиком (тип object и поля).
+    operations_items = by_name["skill_manage"]["input_schema"]["properties"][
+        "operations"
+    ]["items"]
+    assert operations_items["type"] == "object"
+    assert set(operations_items["properties"]) == {"name", "action", "content"}
+    assert operations_items["required"] == ["name", "action", "content"]
+    # Чистый инструмент дошёл без искажений.
+    assert by_name["clarify"]["input_schema"] == HERMES_TOOLS[3]["function"]["parameters"]
+
+
+def test_non_function_tools_keep_passthrough_schema() -> None:
+    tools = [
+        {"type": "web_search_20250305", "name": "web_search", "input_schema": {"anyOf": []}},
+        {"type": "function", "function": {"name": "f", "parameters": {"anyOf": [{"type": "string"}]}}},
+    ]
+    snapshot = json.loads(json.dumps(tools))
+    converted = anthropic_bridge._convert_tools(tools)
+    assert converted[0] == snapshot[0]
+    assert converted[1]["input_schema"] == {"type": "string"}
+    assert tools == snapshot
+
+
+# --------------------------------------------------------------------------- #
+# alias_tool_names: переименование function-tools и de-alias ответа
+# --------------------------------------------------------------------------- #
+def _function_tool(name: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": name,
+            "parameters": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+            },
+        },
+    }
+
+
+def test_alias_tool_names_off_keeps_request_identical() -> None:
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_function_tool("get_weather"), _function_tool("terminal")],
+        "tool_choice": {"type": "function", "function": {"name": "terminal"}},
+    }
+    base = anthropic_bridge.openai_to_anthropic(body, "m")
+    explicit = anthropic_bridge.openai_to_anthropic(body, "m", alias_tool_names=False)
+    assert explicit == base
+    assert [tool["name"] for tool in base["tools"]] == ["get_weather", "terminal"]
+    assert base["tool_choice"] == {"type": "tool", "name": "terminal"}
+
+
+def test_alias_tool_names_deterministic_zero_padded_order() -> None:
+    tools = [_function_tool(f"tool_{index}") for index in range(12)]
+    body = {"messages": [{"role": "user", "content": "hi"}], "tools": tools}
+    request, mapping = anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+        body, "m"
+    )
+    names = [tool["name"] for tool in request["tools"]]
+    assert names[0] == "fn00_tool_0"
+    assert names[9] == "fn09_tool_9"
+    assert names[10] == "fn10_tool_10"
+    # Двузначный префикс сохраняет лексикографический порядок.
+    assert names == sorted(names)
+    assert mapping == {f"fn{index:02d}_tool_{index}": f"tool_{index}" for index in range(12)}
+
+    again, again_map = anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+        body, "m"
+    )
+    assert again["tools"] == request["tools"]
+    assert again_map == mapping
+    # Флаг на одиночной обёртке тоже переименовывает запрос.
+    plain = anthropic_bridge.openai_to_anthropic(body, "m", alias_tool_names=True)
+    assert [tool["name"] for tool in plain["tools"]] == names
+
+
+def test_alias_tool_name_truncated_to_64_and_unique() -> None:
+    long_a = "a" * 80
+    long_b = "a" * 80 + "b"
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [_function_tool(long_a), _function_tool(long_b)],
+    }
+    request, mapping = anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+        body, "m"
+    )
+    first, second = (tool["name"] for tool in request["tools"])
+    assert len(first) == 64
+    assert first == "fn00_" + "a" * 59
+    assert len(second) == 64
+    # Уникальность держится на индексе, хотя имена усечены одинаково.
+    assert first != second
+    assert mapping == {first: long_a, second: long_b}
+
+
+def test_alias_tool_names_applies_to_tool_choice() -> None:
+    tools = [_function_tool("get_weather"), _function_tool("terminal")]
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools,
+        "tool_choice": {"type": "function", "function": {"name": "terminal"}},
+    }
+    request, _ = anthropic_bridge.openai_to_anthropic_with_tool_aliases(body, "m")
+    assert request["tool_choice"] == {"type": "tool", "name": "fn01_terminal"}
+
+    # Anthropic-форма tool_choice тоже переводится на alias.
+    anthropic_choice = {
+        **body,
+        "tool_choice": {"type": "tool", "name": "get_weather"},
+    }
+    request, _ = anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+        anthropic_choice, "m"
+    )
+    assert request["tool_choice"] == {"type": "tool", "name": "fn00_get_weather"}
+
+
+def test_alias_tool_names_skips_non_function_tools() -> None:
+    tools = [
+        {"type": "web_search_20250305", "name": "web_search", "input_schema": {}},
+        _function_tool("terminal"),
+    ]
+    body = {"messages": [{"role": "user", "content": "hi"}], "tools": tools}
+    request, mapping = anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+        body, "m"
+    )
+    assert request["tools"][0] == tools[0]
+    assert request["tools"][1]["name"] == "fn01_terminal"
+    assert mapping == {"fn01_terminal": "terminal"}
+
+
+def test_response_tool_names_dealiased_non_stream() -> None:
+    payload = {
+        "id": "msg_multi",
+        "content": [
+            {"type": "text", "text": "Working"},
+            {"type": "tool_use", "id": "toolu_1", "name": "fn00_get_weather",
+             "input": {"city": "Tokyo"}},
+            {"type": "tool_use", "id": "toolu_2", "name": "fn01_terminal",
+             "input": {"command": "ls"}},
+            {"type": "tool_use", "id": "toolu_3", "name": "not_in_map",
+             "input": {}},
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 3, "output_tokens": 4},
+    }
+    result = anthropic_bridge.anthropic_to_openai(
+        payload,
+        "claude-opus",
+        tool_name_map={"fn00_get_weather": "get_weather", "fn01_terminal": "terminal"},
+    )
+    calls = result["choices"][0]["message"]["tool_calls"]
+    assert [call["function"]["name"] for call in calls] == [
+        "get_weather",
+        "terminal",
+        "not_in_map",
+    ]
+    assert calls[0]["function"]["arguments"] == '{"city": "Tokyo"}'
+
+
+def test_stream_tool_names_dealiased_multi_and_unknown() -> None:
+    raw = sse(
+        ("message_start", {"type": "message_start", "message": {"id": "msg_a"}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "tool_use",
+                                                   "id": "toolu_0",
+                                                   "name": "fn00_get_weather"}}),
+        ("content_block_start", {"type": "content_block_start", "index": 1,
+                                 "content_block": {"type": "tool_use",
+                                                   "id": "toolu_1",
+                                                   "name": "fn01_terminal"}}),
+        ("content_block_start", {"type": "content_block_start", "index": 2,
+                                 "content_block": {"type": "tool_use",
+                                                   "id": "toolu_2",
+                                                   "name": "unknown_alias"}}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ("message_stop", {"type": "message_stop"}),
+    )
+    translator = anthropic_bridge.AnthropicStreamTranslator(
+        "claude-opus",
+        tool_name_map={"fn00_get_weather": "get_weather", "fn01_terminal": "terminal"},
+    )
+    parsed = parse_frames(b"".join(translator.feed(raw) + translator.finish()))
+    names = [
+        chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+        for chunk in parsed[1:]
+        if isinstance(chunk, dict)
+        and chunk["choices"][0]["delta"].get("tool_calls")
+        and "name" in chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+    ]
+    assert names == ["get_weather", "terminal", "unknown_alias"]
+
+
+def test_alias_and_sanitizer_together() -> None:
+    tools = [
+        HERMES_TOOLS[0],
+        HERMES_TOOLS[1],
+        {"type": "web_search_20250305", "name": "web_search", "input_schema": {"anyOf": []}},
+        HERMES_TOOLS[3],
+    ]
+    snapshot = json.loads(json.dumps(tools))
+    body = {"messages": [{"role": "user", "content": "hi"}], "tools": tools}
+    request, mapping = anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+        body, "m"
+    )
+    names = [tool["name"] for tool in request["tools"]]
+    # Индекс — позиция в исходном массиве, pass-through не переименован.
+    assert names == [
+        "fn00_manage_connections",
+        "fn01_terminal",
+        "web_search",
+        "fn03_clarify",
+    ]
+    assert mapping == {
+        "fn00_manage_connections": "manage_connections",
+        "fn01_terminal": "terminal",
+        "fn03_clarify": "clarify",
+    }
+    for tool in request["tools"][:2] + request["tools"][3:]:
+        assert _combinator_paths(tool["input_schema"]) == [], tool["name"]
+        _assert_every_node_typed(tool["input_schema"])
+    # Санитайзер и алиасинг не мутируют исходные tools.
+    assert tools == snapshot
+
+
+
+
 def test_tool_roundtrip_messages() -> None:
     """assistant tool_calls → tool_use; tool-результаты → user с tool_result."""
     body = {
@@ -974,6 +1676,115 @@ def test_gateway_env_flag_requires_real_bool() -> None:
     assert response.status_code == 200
     sent = json.loads(captured["request"].content)
     assert "<env>" in sent["system"][0]["text"]
+
+
+GATEWAY_ALIAS_BODY: dict[str, Any] = {
+    "model": "claude-opus",
+    "messages": [{"role": "user", "content": "weather?"}],
+    "tools": [_function_tool("get_weather"), _function_tool("terminal")],
+    "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+}
+
+
+def test_gateway_alias_tool_names_round_trip() -> None:
+    """Флаг upstream'а переименовывает tools и de-alias'ит ответ."""
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(
+            200,
+            json=anthropic_message(
+                text="",
+                stop_reason="tool_use",
+                tool_use={
+                    "id": "toolu_1",
+                    "name": "fn00_get_weather",
+                    "input": {"city": "Tokyo"},
+                },
+            ),
+        )
+
+    config = json.loads(json.dumps(ANTHROPIC_CONFIG))
+    config["upstreams"]["kraube"]["alias_tool_names"] = True
+
+    with make_client(handler, config) as client:
+        response = client.post(
+            "/v1/chat/completions", headers=AUTH, json=GATEWAY_ALIAS_BODY
+        )
+
+    assert response.status_code == 200
+    sent = json.loads(captured["request"].content)
+    assert [tool["name"] for tool in sent["tools"]] == [
+        "fn00_get_weather",
+        "fn01_terminal",
+    ]
+    assert sent["tool_choice"] == {"type": "tool", "name": "fn00_get_weather"}
+    calls = response.json()["choices"][0]["message"]["tool_calls"]
+    assert calls[0]["function"]["name"] == "get_weather"
+
+
+def test_gateway_alias_flag_requires_real_bool() -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json=anthropic_message())
+
+    config = json.loads(json.dumps(ANTHROPIC_CONFIG))
+    config["upstreams"]["kraube"]["alias_tool_names"] = "yes"
+
+    with make_client(handler, config) as client:
+        response = client.post(
+            "/v1/chat/completions", headers=AUTH, json=GATEWAY_ALIAS_BODY
+        )
+
+    assert response.status_code == 200
+    sent = json.loads(captured["request"].content)
+    assert [tool["name"] for tool in sent["tools"]] == ["get_weather", "terminal"]
+    assert sent["tool_choice"] == {"type": "tool", "name": "get_weather"}
+
+
+def test_gateway_alias_tool_names_stream_round_trip() -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        raw = sse(
+            ("message_start", {"type": "message_start", "message": {"id": "msg_s"}}),
+            ("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "tool_use",
+                                                       "id": "toolu_1",
+                                                       "name": "fn00_get_weather"}}),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        return httpx.Response(
+            200, content=raw, headers={"content-type": "text/event-stream"}
+        )
+
+    config = json.loads(json.dumps(ANTHROPIC_CONFIG))
+    config["upstreams"]["kraube"]["alias_tool_names"] = True
+
+    with make_client(handler, config) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=AUTH,
+            json={**GATEWAY_ALIAS_BODY, "stream": True},
+        )
+
+    assert response.status_code == 200
+    sent = json.loads(captured["request"].content)
+    assert sent["tools"][0]["name"] == "fn00_get_weather"
+    parsed = parse_frames(response.content)
+    starts = [
+        chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+        for chunk in parsed
+        if isinstance(chunk, dict)
+        and chunk.get("choices")
+        and chunk["choices"][0]["delta"].get("tool_calls")
+        and "name" in chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+    ]
+    assert starts == ["get_weather"]
 
 
 def test_gateway_passthrough_anthropic_model() -> None:

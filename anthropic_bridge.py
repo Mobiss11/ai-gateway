@@ -26,6 +26,15 @@ user-сообщение (содержимое и ``<env>``-теги сохран
 остаётся у модели, классификация не срабатывает. По умолчанию выключено —
 system уходит upstream'у как есть.
 
+**Alias имён инструментов** (``alias_tool_names``): классификатор
+«third-party app» у OAuth-подписки срабатывает и на набор имён tools
+(ко-встречаемость пар вроде ``skill_view``/``skill_manage``), поэтому
+флаг upstream'а детерминированно переименовывает все function-инструменты
+в ``fnNN_<name>`` (``NN`` — индекс в ``tools``, имя обрезается до 64
+символов) и возвращает карту ``{alias: original}``, которой мост
+de-alias'ит имена в ответе (stream и non-stream). Схемы, system и
+остальной payload не меняются; по умолчанию выключено.
+
 **Prompt caching** (как в Claude Code): Anthropic-кэш неавтоматический —
 мост сам ставит до трёх ``cache_control: ephemeral`` брейкпоинтов: на
 system-блоке (кэшируется весь префикс с identity-преамбулой kraube), на
@@ -326,6 +335,113 @@ def _convert_messages(messages: Any) -> tuple[list[dict[str, Any]], str | None]:
     return result, system
 
 
+# Комбинаторы JSON Schema, которые отвергает валидатор upstream'а
+# «anthropic» (Claude по OAuth-подписке): запрос с любым anyOf/oneOf/allOf в
+# input_schema детерминированно получает 400 «tools.N.custom.input_schema:
+# JSON schema is invalid. It must match JSON Schema draft 2020-12», хотя
+# формально эти ключевые слова в draft 2020-12 есть. Порядок важен: тип
+# замены берём из первого непустого комбинатора.
+_COMBINATOR_KEYS = ("anyOf", "oneOf", "allOf")
+
+# Из узла с комбинатором переносим в замену человекочитаемые поля (исходные
+# значения важнее полей выбранного member'а).
+_COMBINATOR_KEEP = ("description", "default")
+
+# Валидатор upstream'а — Go-структура Schema: каждый узел обязан иметь ровно
+# один строковый "type" (items: {} и items: {"description": …} дают 400), а
+# type-массив ("type": ["string","object"]) не парсится вообще. Поэтому любая
+# замена обязана быть типизированной. Аргументы модели upstream со схемой
+# строго не сверяет (строка при "items": {"type":"object"} проходит), так что
+# сведение union'а к одному типу безопасно.
+_TYPE_FALLBACK = "object"
+
+
+def _node_type(node: Any) -> str | None:
+    """Строковый type узла; для type-массива — первый строковый элемент."""
+    if not isinstance(node, dict):
+        return None
+    value = node.get("type")
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item:
+                return item
+    return None
+
+
+def _needs_sanitizing(node: Any) -> bool:
+    """Нужна ли правка: anyOf/oneOf/allOf или type-массив где-то в дереве."""
+    if isinstance(node, dict):
+        if any(key in _COMBINATOR_KEYS for key in node):
+            return True
+        if isinstance(node.get("type"), list):
+            return True
+        return any(_needs_sanitizing(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_needs_sanitizing(item) for item in node)
+    return False
+
+
+def _strip_combinator_nodes(node: Any) -> Any:
+    """Рекурсивная копия дерева схемы без комбинаторов и type-массивов."""
+    if isinstance(node, dict):
+        if any(key in _COMBINATOR_KEYS for key in node):
+            # Первый member (по порядку anyOf → oneOf → allOf) с валидным
+            # строковым type становится базой замены: его вложенные
+            # properties/required/enum сохраняются.
+            base: dict[str, Any] | None = None
+            for comb_key in _COMBINATOR_KEYS:
+                members = node.get(comb_key)
+                if not isinstance(members, list):
+                    continue
+                for member in members:
+                    if _node_type(member) is None:
+                        continue
+                    base = _strip_combinator_nodes(member)
+                    break
+                if base is not None:
+                    break
+            if not isinstance(base, dict):
+                base = {"type": _TYPE_FALLBACK}
+            for key in _COMBINATOR_KEEP:
+                if key in node:
+                    base[key] = node[key]
+            return base
+        result = {key: _strip_combinator_nodes(value) for key, value in node.items()}
+        if isinstance(result.get("type"), list):
+            # type-массив не парсится Go-валидатором — оставляем один тип.
+            result["type"] = _node_type(node) or _TYPE_FALLBACK
+        return result
+    if isinstance(node, list):
+        return [_strip_combinator_nodes(item) for item in node]
+    return node
+
+
+def _sanitize_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Привести OpenAI-схему аргументов инструмента к валидатору upstream'а.
+
+    Зачем: upstream ``anthropic`` (Claude по OAuth-подписке) валидирует
+    ``input_schema`` строже публичного API. Любой anyOf/oneOf/allOf даёт 400
+    «JSON schema is invalid. It must match JSON Schema draft 2020-12», хотя
+    эти ключевые слова в draft 2020-12 входят; кроме того, каждый узел обязан
+    иметь один строковый ``type`` (пустой ``{}`` и ``{"description": …}``
+    тоже 400), а type-массив не парсится Go-структурой. Клиенты (Hermes
+    Agent и др.) используют комбинаторы свободно, поэтому чистим рекурсивно:
+    узел с комбинатором заменяется типизированной схемой первого member'а с
+    валидным ``type`` (или ``{"type": "object"}``), поверх которой ложатся
+    description/default исходного узла, а type-массивы сводятся к первому
+    строковому типу.
+
+    Схему без комбинаторов и type-массивов возвращаем тем же объектом — ни
+    одной лишней копии (payload'ы клиентов бывают в сотни килобайт). В
+    остальных случаях собираем новые dict/list и вход не мутируем.
+    """
+    if not _needs_sanitizing(schema):
+        return schema
+    return _strip_combinator_nodes(schema)
+
+
 def _convert_tools(tools: Any) -> list[dict[str, Any]]:
     if not isinstance(tools, list):
         raise TranslationError("tools must be a list")
@@ -340,6 +456,9 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]]:
             schema = function.get("parameters")
             if not isinstance(schema, dict):
                 schema = {"type": "object", "properties": {}}
+            # Upstream «anthropic» 400-ит на комбинаторы в input_schema —
+            # чистим их на лету (см. _sanitize_tool_schema).
+            schema = _sanitize_tool_schema(schema)
             converted.append(
                 {
                     "name": str(function["name"]),
@@ -353,6 +472,70 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]]:
             # мутировать тело запроса клиента.
             converted.append(dict(tool))
     return converted
+
+
+# Anthropic принимает имена инструментов только до 64 символов.
+_MAX_TOOL_NAME_LEN = 64
+
+
+def _alias_tool_name(index: int, name: str) -> str:
+    """Детерминированный alias ``fnNN_<name>`` не длиннее 64 символов.
+
+    ``NN`` — позиция инструмента в массиве ``tools`` (два знака, чтобы
+    лексикографический порядок совпадал с исходным); длинное имя
+    обрезается, хвост индекса остаётся уникальным.
+    """
+    prefix = f"fn{index:02d}_"
+    budget = _MAX_TOOL_NAME_LEN - len(prefix)
+    if budget <= 0:  # pragma: no cover - индекс в tools такого не даёт
+        return prefix[:_MAX_TOOL_NAME_LEN]
+    return prefix + name[:budget]
+
+
+def _alias_function_tools(
+    tools: list[Any], converted: list[dict[str, Any]]
+) -> dict[str, str]:
+    """Переименовать function-инструменты, вернуть карту {alias: original}.
+
+    Anthropic-классификатор «third-party app» срабатывает на набор имён
+    инструментов (ко-встречаемость пар вроде skill_view/skill_manage).
+    Детерминированный префикс по индексу ломает точные совпадения, не
+    меняя схемы и порядок. Non-function (pass-through) инструменты не
+    трогаем — их имён в карте нет.
+    """
+    mapping: dict[str, str] = {}
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        item = converted[index]
+        original = item["name"]
+        alias = _alias_tool_name(index, original)
+        item["name"] = alias
+        mapping[alias] = original
+    return mapping
+
+
+def _alias_tool_choice(
+    choice: dict[str, Any], tool_name_map: dict[str, str]
+) -> None:
+    """Перевести имя в ``tool_choice`` на alias (если оно там есть)."""
+    if choice.get("type") != "tool":
+        return
+    original_to_alias: dict[str, str] = {}
+    for alias, original in tool_name_map.items():
+        original_to_alias.setdefault(original, alias)
+    name = choice.get("name")
+    if isinstance(name, str) and name in original_to_alias:
+        choice["name"] = original_to_alias[name]
+
+
+def _map_tool_name(name: Any, tool_name_map: dict[str, str] | None) -> str:
+    """alias → исходное имя; неизвестные имена проходят как есть."""
+    text = str(name or "")
+    if tool_name_map:
+        return tool_name_map.get(text, text)
+    return text
+
 
 
 def _convert_tool_choice(
@@ -544,18 +727,15 @@ def _prepend_env_block(messages: list[dict[str, Any]], env_section: str) -> None
     content.insert(insert_at, {"type": "text", "text": env_section})
 
 
-def openai_to_anthropic(
+def _translate_request(
     body: dict[str, Any],
     provider_model: str,
     *,
     default_max_tokens: int = DEFAULT_MAX_TOKENS,
     move_env_to_user: bool = False,
-) -> dict[str, Any]:
-    """Тело POST /v1/chat/completions → тело POST /v1/messages.
-
-    ``move_env_to_user`` — перенос env-секции OpenCode из system в первое
-    user-сообщение (см. модульный docstring); по умолчанию выключено.
-    """
+    alias_tool_names: bool = False,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Общая реализация перевода: (тело /v1/messages, карта alias→original)."""
     if not isinstance(body, dict):
         raise TranslationError("request body must be an object")
 
@@ -611,12 +791,17 @@ def openai_to_anthropic(
         request["stop_sequences"] = [str(item) for item in stop if item]
 
     tools = body.get("tools")
+    tool_name_map: dict[str, str] = {}
     if tools:
         request["tools"] = _convert_tools(tools)
+        if alias_tool_names:
+            tool_name_map = _alias_function_tools(tools, request["tools"])
         tool_choice = _convert_tool_choice(
             body.get("tool_choice"), body.get("parallel_tool_calls")
         )
         if tool_choice is not None:
+            if tool_name_map:
+                _alias_tool_choice(tool_choice, tool_name_map)
             request["tool_choice"] = tool_choice
     elif body.get("tool_choice") not in (None, "none"):
         raise TranslationError("tool_choice specified without tools")
@@ -625,7 +810,59 @@ def openai_to_anthropic(
         request["thinking"] = thinking
     if output_config is not None:
         request["output_config"] = output_config
-    return _apply_prompt_cache(request)
+    return _apply_prompt_cache(request), tool_name_map
+
+
+def openai_to_anthropic(
+    body: dict[str, Any],
+    provider_model: str,
+    *,
+    default_max_tokens: int = DEFAULT_MAX_TOKENS,
+    move_env_to_user: bool = False,
+    alias_tool_names: bool = False,
+) -> dict[str, Any]:
+    """Тело POST /v1/chat/completions → тело POST /v1/messages.
+
+    ``move_env_to_user`` — перенос env-секции OpenCode из system в первое
+    user-сообщение (см. модульный docstring); по умолчанию выключено.
+
+    ``alias_tool_names`` — переименовать function-инструменты в
+    ``fnNN_<name>`` (см. модульный docstring). Обратную карту для перевода
+    ответа возвращает :func:`openai_to_anthropic_with_tool_aliases`; эта
+    обёртка нужна, когда ответ идёт клиенту без de-alias.
+    """
+    request, _ = _translate_request(
+        body,
+        provider_model,
+        default_max_tokens=default_max_tokens,
+        move_env_to_user=move_env_to_user,
+        alias_tool_names=alias_tool_names,
+    )
+    return request
+
+
+def openai_to_anthropic_with_tool_aliases(
+    body: dict[str, Any],
+    provider_model: str,
+    *,
+    default_max_tokens: int = DEFAULT_MAX_TOKENS,
+    move_env_to_user: bool = False,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Перевод запроса с alias'ами имён инструментов и обратной картой.
+
+    Возвращает ``(request, {alias: original})`` — карта нужна, чтобы
+    вернуть клиенту исходные имена в tool_calls/tool_use (в том числе в
+    streaming). Флаг отдельный, потому что карта должна пережить перевод
+    ответа; выключенный по умолчанию путь идёт через
+    :func:`openai_to_anthropic`.
+    """
+    return _translate_request(
+        body,
+        provider_model,
+        default_max_tokens=default_max_tokens,
+        move_env_to_user=move_env_to_user,
+        alias_tool_names=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -659,9 +896,17 @@ def _finish_reason(stop_reason: Any) -> str:
 
 
 def anthropic_to_openai(
-    payload: Any, model_alias: str, *, created: int | None = None
+    payload: Any,
+    model_alias: str,
+    *,
+    created: int | None = None,
+    tool_name_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Тело ответа /v1/messages → тело ответа /v1/chat/completions."""
+    """Тело ответа /v1/messages → тело ответа /v1/chat/completions.
+
+    ``tool_name_map`` ({alias: original}) возвращает клиенту исходные имена
+    инструментов; неизвестные имена остаются как есть.
+    """
     if not isinstance(payload, dict):
         raise TranslationError("anthropic response must be an object")
 
@@ -682,7 +927,7 @@ def anthropic_to_openai(
                     "id": str(block.get("id") or ""),
                     "type": "function",
                     "function": {
-                        "name": str(block.get("name") or ""),
+                        "name": _map_tool_name(block.get("name"), tool_name_map),
                         "arguments": json.dumps(
                             block.get("input") or {}, ensure_ascii=False
                         ),
@@ -747,9 +992,16 @@ class AnthropicStreamTranslator:
     кадры, если событие ``message_stop`` не пришло.
     """
 
-    def __init__(self, model_alias: str, *, include_usage: bool = False) -> None:
+    def __init__(
+        self,
+        model_alias: str,
+        *,
+        include_usage: bool = False,
+        tool_name_map: dict[str, str] | None = None,
+    ) -> None:
         self._model_alias = model_alias
         self._include_usage = include_usage
+        self._tool_name_map = tool_name_map or {}
         self._created = int(time.time())
         self._id = "chatcmpl-anthropic"
         self._buffer = b""
@@ -855,7 +1107,10 @@ class AnthropicStreamTranslator:
                                         "id": str(block.get("id") or ""),
                                         "type": "function",
                                         "function": {
-                                            "name": str(block.get("name") or ""),
+                                            "name": _map_tool_name(
+                                                block.get("name"),
+                                                self._tool_name_map,
+                                            ),
                                             "arguments": "",
                                         },
                                     }

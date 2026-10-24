@@ -53,7 +53,9 @@ DEFAULT_ENV_FILE = "~/.config/ai-gateway/env"
 # now draw from your extra usage…», 04.10.2026). Триггер — не агентная
 # идентичность, а env-секция в системном промпте (Today's date + интро +
 # <env>…</env>); флаг upstream'а move_env_to_user переносит её в первое
-# user-сообщение (см. anthropic_bridge). Это не флейк — но на случай
+# user-сообщение (см. anthropic_bridge). Второй триггер — набор имён tools;
+# флаг alias_tool_names детерминированно переименовывает их (fnNN_<name>) и
+# de-alias'ит ответы. Это не флейк — но на случай
 # genuinely транзиентных 400 оставлен короткий повтор (2×~1 c).
 _ANTHROPIC_FLAKE_BACKOFF = (0.5, 1.0)
 _ANTHROPIC_FLAKE_MARKER = b"extra usage"
@@ -666,12 +668,24 @@ async def _proxy_anthropic_chat(
             err_type="upstream_error",
         )
     env_move = upstream.get("move_env_to_user")
+    name_alias = upstream.get("alias_tool_names")
+    alias_names = isinstance(name_alias, bool) and name_alias
+    tool_name_map: dict[str, str] = {}
     try:
-        anthropic_request = anthropic_bridge.openai_to_anthropic(
-            body,
-            provider_model,
-            move_env_to_user=isinstance(env_move, bool) and env_move,
-        )
+        if alias_names:
+            anthropic_request, tool_name_map = (
+                anthropic_bridge.openai_to_anthropic_with_tool_aliases(
+                    body,
+                    provider_model,
+                    move_env_to_user=isinstance(env_move, bool) and env_move,
+                )
+            )
+        else:
+            anthropic_request = anthropic_bridge.openai_to_anthropic(
+                body,
+                provider_model,
+                move_env_to_user=isinstance(env_move, bool) and env_move,
+            )
     except anthropic_bridge.TranslationError as exc:
         return _openai_error(
             f"Request cannot be translated to Anthropic Messages format: {exc}",
@@ -783,7 +797,9 @@ async def _proxy_anthropic_chat(
 
     if is_stream and upstream_response.status_code < 400:
         translator = anthropic_bridge.AnthropicStreamTranslator(
-            str(requested_model), include_usage=include_usage
+            str(requested_model),
+            include_usage=include_usage,
+            tool_name_map=tool_name_map,
         )
 
         async def stream_body() -> Iterator[bytes]:
@@ -841,7 +857,7 @@ async def _proxy_anthropic_chat(
     try:
         payload = json.loads(content)
         openai_response = anthropic_bridge.anthropic_to_openai(
-            payload, str(requested_model)
+            payload, str(requested_model), tool_name_map=tool_name_map
         )
     except (ValueError, TypeError) as exc:
         return _openai_error(

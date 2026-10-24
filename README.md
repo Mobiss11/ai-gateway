@@ -67,6 +67,7 @@ extra-usage 400.
 | 🧠 Reasoning | `reasoning_effort` / `reasoning.effort` → `output_config.effort` для Claude 5+ (adaptive thinking), `thinking.budget_tokens` для старых моделей (none → выключено) |
 | ⚡ Prompt cache | `cache_control`-брейкпоинты как в Claude Code: system → инструменты → история; повторяющийся префикс ~0.1x цены |
 | 🛡️ Anthropic-гоча | `move_env_to_user`: env-секция агентных клиентов переносится из system в user — иначе OAuth-подписка 400-ит «third-party app» |
+| 🏷️ Tool-алиасы | `alias_tool_names`: детерминированные `fnNN_<name>` для всех function-tools и обратный de-alias в ответе (stream/non-stream) — обход того же 400, когда классификатор срабатывает на имена инструментов |
 | 🧰 Tools | `tools`/`tool_choice` ↔ `tool_use`/`tool_result`, картинки `data:`/`http(s)` |
 | 📊 Usage | `input + cache_read + cache_creation` → `prompt_tokens`, cache-поля честно пробрасываются; опциональный usage-webhook после каждого запроса |
 | 🗂️ Каталог | метаданные моделей (context/output/capabilities/variants/цены) из `GET /models` по allowlist, офлайн-сид, синк в конфиг OpenCode |
@@ -182,6 +183,7 @@ streaming, tools и `usage` с cache-полями. Типичный источн
     "api_key_env": "KRAUBE_SERVE_KEY",
     "api_format": "anthropic",
     "move_env_to_user": true,
+    "alias_tool_names": false,
     "headers": {}
   }
 },
@@ -197,7 +199,10 @@ streaming, tools и `usage` с cache-полями. Типичный источн
 - `base_url` — корень без `/v1` (шлюз сам дописывает `/v1/messages`);
 - `api_key_env` — ключ `--auth-key` демона kraube (loopback без ключа
   kraube запускать не даст — и правильно);
-- `move_env_to_user: true` — см. ниже, для kraube включён.
+- `move_env_to_user: true` — см. ниже, для kraube включён;
+- `alias_tool_names: true` — если 400 «third-party app» срабатывает на
+  набор имён инструментов: шлюз шлёт upstream'у `fnNN_<name>`, а клиенту
+  возвращает исходные имена (см. ниже); по умолчанию выключено.
 
 Запуск демона и туннеля — шаблонами LaunchAgent из `deploy/`
 (`com.alluc.kraube-serve.plist.example`,
@@ -256,6 +261,16 @@ about the environment you are running in:» + `<env>…</env>`). Обычные
   `tool_result`-блоков);
 - модель контекст не теряет, классификация не срабатывает; незакрытый
   `<env>` не трогается; по умолчанию флаг выключен — system уходит как есть.
+
+Второй, независимый триггер той же классификации — **набор имён
+инструментов** (ко-встречаемость пар вроде `skill_view`/`skill_manage`):
+переименования одного имени из пары достаточно, чтобы набор прошёл.
+Поэтому при `alias_tool_names: true` шлюз детерминированно переименовывает
+все function-инструменты в `fnNN_<name>` (`NN` — индекс в `tools`, имя
+обрезается до лимита Anthropic в 64 символа), а в ответе — и в streaming,
+и в non-stream — возвращает клиенту исходные имена. Схемы, system и
+порядок инструментов не меняются; non-function (pass-through) tools не
+переименовываются; по умолчанию флаг выключен.
 
 Дифференциальные пробы, зафиксировавшие триггер, — в
 [`opencode-claude-subscription/docs/third-party-app-400.md`](https://github.com/Mobiss11/opencode-claude-subscription/blob/main/docs/third-party-app-400.md).
